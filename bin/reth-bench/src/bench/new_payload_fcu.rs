@@ -11,6 +11,7 @@ use crate::{
     },
     valid_payload::{block_to_new_payload, call_forkchoice_updated, call_new_payload},
 };
+use alloy_primitives::Bytes;
 use alloy_provider::Provider;
 use alloy_rpc_types_engine::ForkchoiceState;
 use clap::Parser;
@@ -18,9 +19,10 @@ use csv::Writer;
 use eyre::Context;
 use humantime::parse_duration;
 use reth_cli_runner::CliContext;
+use reth_node_api::EngineApiMessageVersion;
 use reth_node_core::args::BenchmarkArgs;
 use std::time::{Duration, Instant};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// `reth benchmark new-payload-fcu` command
 #[derive(Debug, Parser)]
@@ -59,7 +61,37 @@ impl Command {
                 let block = block_res.unwrap().unwrap();
                 let header = block.header.clone();
 
-                let (version, params) = block_to_new_payload(block, is_optimism).unwrap();
+                let (version, mut params) = block_to_new_payload(block, is_optimism).unwrap();
+
+                // EIP-7685 execution requests cannot be recovered from the execution
+                // layer. The EL derives them while executing, keeps only requestsHash in
+                // the header, and no eth_ RPC returns them, so block_to_new_payload has
+                // nothing to work with and emits an empty list. The EL then hashes that
+                // empty list and rejects any block that really did carry requests, with
+                // a blockhash mismatch. Ask the block source for the real ones instead.
+                // They are the 4th argument of engine_newPayloadV4.
+                if matches!(version, EngineApiMessageVersion::V4) {
+                    let reqs: Vec<Bytes> = match block_provider
+                        .client()
+                        .request("bench_getExecutionRequests", (header.number,))
+                        .await
+                    {
+                        Ok(reqs) => reqs,
+                        Err(err) => {
+                            warn!(
+                                "bench_getExecutionRequests failed for block {}: {err}. \
+                                 Falling back to an empty list, so any block with \
+                                 execution requests will be rejected.",
+                                header.number
+                            );
+                            Vec::new()
+                        }
+                    };
+                    if let Some(slot) = params.as_array_mut().and_then(|a| a.get_mut(3)) {
+                        *slot = serde_json::to_value(&reqs).unwrap();
+                    }
+                }
+
                 let head_block_hash = header.hash;
                 let safe_block_hash =
                     block_provider.get_block_by_number(header.number.saturating_sub(32).into());

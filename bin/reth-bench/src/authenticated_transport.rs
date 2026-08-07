@@ -106,6 +106,14 @@ impl InnerTransport {
     }
 }
 
+/// How early to replace the jwt, in seconds.
+///
+/// The token is checked here but validated by the server after the request has been
+/// queued and sent, and geth rejects anything issued more than 60 seconds ago with
+/// "stale token". Refreshing one second early leaves no room for that gap, and under
+/// load a request can easily take longer, which ends the run on a 401.
+const AUTH_REFRESH_BUFFER_SECS: u64 = 15;
+
 /// An authenticated transport that can be used to send requests that contain a jwt bearer token.
 #[derive(Debug, Clone)]
 pub struct AuthenticatedTransport {
@@ -161,9 +169,9 @@ impl AuthenticatedTransport {
         Box::pin(async move {
             let mut inner_and_claims = this.inner_and_claims.write().await;
 
-            // shift the iat forward by one second so there is some buffer time
+            // shift the iat forward so there is some buffer time
             let mut shifted_claims = inner_and_claims.1;
-            shifted_claims.iat -= 1;
+            shifted_claims.iat -= AUTH_REFRESH_BUFFER_SECS;
 
             // if the claims are out of date, reset the inner transport
             if !shifted_claims.is_within_time_window() {
